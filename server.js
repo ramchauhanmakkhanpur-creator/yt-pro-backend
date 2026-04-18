@@ -1,39 +1,92 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const ytSearch = require('yt-search');
-const TelegramBot = require('node-telegram-bot-api');
+const puppeteer = require('puppeteer');
 
 const app = express();
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+app.use(cors());
 
-// APNA TELEGRAM BOT TOKEN
-const token = process.env.TELEGRAM_BOT_TOKEN || '8599806886:AAGEe3CNv_r5qoCHQZwSNjeVqgcAwDrGyOA'; 
-const bot = new TelegramBot(token, { polling: true });
+// --- HELPER FUNCTIONS (The Scrapers) ---
 
-// 🚨 YAHAN APNA VERCEL WALA LINK DALNA (Host karne ke baad)
-const webAppUrl = process.env.FRONTEND_URL || 'https://your-vercel-link.vercel.app'; 
+// 1. YouTube Scraper (Official Fast Library)
+async function fetchYouTube(query) {
+    const r = await ytSearch(query);
+    return r.videos.slice(0, 10).map(v => ({
+        videoId: v.videoId,
+        title: v.title,
+        thumbnail: v.image,
+        source: 'youtube', // Source tag added
+        url: v.url
+    }));
+}
 
-bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, "🎬 **YouTube Pro VIP**\n\nAds-free videos aur premium experience ke liye niche click karein! 👇", {
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [[{ text: "🚀 Open YouTube Pro", web_app: { url: webAppUrl } }]] }
-    });
-});
-
-// Universal Search API
-app.get('/api/search', async (req, res) => {
+// 2. Facebook/Web Scraper (Puppeteer Headless Browser)
+async function fetchWebVideos(query) {
     try {
-        const query = req.query.q || 'trending videos india';
-        const r = await ytSearch(query);
-        const results = r.videos.map(v => ({
-            videoId: v.videoId, title: v.title, thumbnail: v.image,
-            uploaderName: v.author.name, duration: v.duration.seconds
-        }));
-        res.json({ results });
-    } catch (error) { res.status(500).json({ error: 'Search Fail' }); }
+        const browser = await puppeteer.launch({ 
+            headless: "new",
+            args: ['--no-sandbox', '--disable-setuid-sandbox'] // Server par chalne ke liye zaroori
+        });
+        const page = await browser.newPage();
+        
+        // Dummy search strategy for Web/FB (Dailymotion used as safe example for videos)
+        await page.goto(`https://www.dailymotion.com/search/${encodeURIComponent(query)}/videos`, { waitUntil: 'domcontentloaded' });
+        
+        // Extracting data from page
+        const videos = await page.evaluate(() => {
+            let results = [];
+            let items = document.querySelectorAll('a[data-testid="video-card"]'); // Adjust selector based on site
+            for(let i=0; i<Math.min(items.length, 10); i++) {
+                results.push({
+                    videoId: items[i].href.split('/video/')[1],
+                    title: items[i].innerText || 'Web Video',
+                    thumbnail: 'https://via.placeholder.com/400x220.png?text=Web+Video', // Placeholder for now
+                    source: 'web',
+                    url: items[i].href
+                });
+            }
+            return results;
+        });
+
+        await browser.close();
+        return videos;
+    } catch (err) {
+        console.error("Web Scraper Error:", err);
+        return [];
+    }
+}
+
+// --- MAIN API ENDPOINT ---
+
+app.get('/api/search', async (req, res) => {
+    const query = req.query.q;
+    const page = req.query.page || 1;
+    
+    if (!query) return res.status(400).json({ error: "Query missing" });
+
+    try {
+        // PARALLEL FETCHING: Teeno/Dono scraper ek sath daudenge (Super Fast)
+        const [ytResults, webResults] = await Promise.allSettled([
+            fetchYouTube(`${query} part ${page}`),
+            fetchWebVideos(query) // Puppeteer scraper
+        ]);
+
+        // Jo data successful aaya usko combine karo
+        let combinedResults = [];
+        if (ytResults.status === 'fulfilled') combinedResults.push(...ytResults.value);
+        if (webResults.status === 'fulfilled') combinedResults.push(...webResults.value);
+
+        // Results ko mix (shuffle) kar do taaki feed natural lage
+        combinedResults = combinedResults.sort(() => Math.random() - 0.5);
+
+        res.json({ results: combinedResults });
+    } catch (error) {
+        console.error("Aggregation Error:", error);
+        res.status(500).json({ error: "Failed to fetch videos" });
+    }
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Universal Backend running on port ${PORT}`);
+});
