@@ -1,50 +1,109 @@
 const express = require('express');
 const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
+const fs = require('fs');
 const ytSearch = require('yt-search');
 
 const app = express();
 app.use(cors());
+app.use(express.json({ limit: '10mb' }));
 
-// Single API for everything (Home, Search, Shorts)
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
+if (!fs.existsSync('./data')) fs.mkdirSync('./data');
+const USERS_FILE = './data/users.json';
+const CHATS_FILE = './data/chats.json';
+
+if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, '[]');
+if (!fs.existsSync(CHATS_FILE)) fs.writeFileSync(CHATS_FILE, '[]');
+
+const getUsers = () => { try { return JSON.parse(fs.readFileSync(USERS_FILE)); } catch(e) { return []; } };
+const saveUsers = (data) => fs.writeFileSync(USERS_FILE, JSON.stringify(data));
+const getChats = () => { try { return JSON.parse(fs.readFileSync(CHATS_FILE)); } catch(e) { return []; } };
+const saveChats = (data) => fs.writeFileSync(CHATS_FILE, JSON.stringify(data));
+
+// 📺 YOUTUBE API
 app.get('/api/videos', async (req, res) => {
     const { type, q, page = 1 } = req.query;
-    
     try {
-        let query = '';
-        
-        // 1. HOME PAGE LOGIC (Mix trending content)
-        if (type === 'home') query = `trending viral videos india part ${page}`;
-        
-        // 2. SEARCH PAGE LOGIC (Keyword matching)
-        else if (type === 'search') query = `${q} part ${page}`;
-        
-        // 3. SHORTS PAGE LOGIC (Category based short videos)
-        else if (type === 'shorts') query = `${q === 'Mix' ? 'viral trending' : q} shorts part ${page}`;
-
-        // Fetch from YouTube
+        let query = type === 'home' ? `trending viral videos india part ${page}` : type === 'shorts' ? `viral shorts ${page}` : `${q} part ${page}`;
         const r = await ytSearch(query);
         let videos = r.videos;
-
-        // If it's shorts, strictly filter videos under 2 minutes (120 seconds)
-        if (type === 'shorts') {
-            videos = videos.filter(v => v.seconds < 120);
-        }
-
-        // Send Clean Data
-        res.json({ 
-            results: videos.map(v => ({
-                videoId: v.videoId,
-                title: v.title,
-                thumbnail: v.image,
-                duration: v.timestamp,
-                author: v.author.name
-            }))
-        });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Server Error' });
-    }
+        if (type === 'shorts') videos = videos.filter(v => v.seconds < 120);
+        res.json({ results: videos.map(v => ({ videoId: v.videoId, title: v.title, thumbnail: v.image, duration: v.timestamp, author: v.author.name })) });
+    } catch (err) { res.status(500).json({ error: 'Server Error' }); }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Clean YouTube Backend running on port ${PORT}`));
+// 🔐 AUTH & USERS
+app.post('/api/signup', (req, res) => {
+    const { username, password, dp } = req.body; let users = getUsers();
+    if (users.find(u => u.username === username)) return res.status(400).json({ error: "Username taken!" });
+    users.push({ username, password, dp: dp || 'https://via.placeholder.com/150' }); saveUsers(users); res.json({ success: true, username, dp });
+});
+app.post('/api/login', (req, res) => {
+    const { username, password } = req.body; let user = getUsers().find(u => u.username === username && u.password === password);
+    if (user) res.json({ success: true, username: user.username, dp: user.dp }); else res.status(400).json({ error: "Wrong details!" });
+});
+app.post('/api/update-dp', (req, res) => {
+    const { username, dp } = req.body; let users = getUsers(); let index = users.findIndex(u => u.username === username);
+    if(index !== -1) { users[index].dp = dp; saveUsers(users); res.json({ success: true, dp }); } else res.status(400).json({ error: "User not found" });
+});
+app.get('/api/users/:me', (req, res) => {
+    const me = req.params.me; let users = getUsers().filter(u => u.username !== me); let allChats = getChats();
+    let usersWithChats = users.map(u => {
+        let room = [me, u.username].sort().join('_'); let roomChats = allChats.filter(c => c.room === room);
+        let lastMsg = roomChats.length > 0 ? roomChats[roomChats.length - 1] : null;
+        let unread = roomChats.filter(c => c.sender === u.username && c.status !== 'seen').length;
+        return { username: u.username, dp: u.dp, lastMessage: lastMsg, unread };
+    }); res.json(usersWithChats);
+});
+app.get('/api/chats/:room', (req, res) => res.json(getChats().filter(c => c.room === req.params.room)));
+
+// 🔥 THE PRESENCE ENGINE (Online/Offline Tracking)
+const onlineUsers = new Set();
+const socketMap = {}; // Socket ID se username track karne ke liye
+
+io.on('connection', (socket) => {
+    
+    // User online aata hai
+    socket.on('go_online', (username) => {
+        socketMap[socket.id] = username;
+        onlineUsers.add(username);
+        io.emit('online_users_update', Array.from(onlineUsers)); // Sabko batao
+    });
+
+    // User offline jata hai (App band karta hai)
+    socket.on('disconnect', () => {
+        const user = socketMap[socket.id];
+        if (user) {
+            onlineUsers.delete(user);
+            io.emit('online_users_update', Array.from(onlineUsers));
+            delete socketMap[socket.id];
+        }
+    });
+
+    socket.on('join_room', (room) => socket.join(room));
+    
+    socket.on('send_message', (data) => {
+        data.status = 'sent'; let chats = getChats(); chats.push(data); saveChats(chats);
+        io.to(data.room).emit('receive_message', data);
+    });
+
+    // 💬 TYPING LOGIC (Room & Global)
+    socket.on('typing', ({ room, sender }) => socket.to(room).emit('user_typing', sender));
+    socket.on('stop_typing', ({ room }) => socket.to(room).emit('user_stopped_typing'));
+    
+    // Naya: Bahar list mein typing dikhane ke liye
+    socket.on('typing_global', ({ sender, receiver }) => io.emit('global_typing_status', { sender, receiver, isTyping: true }));
+    socket.on('stop_typing_global', ({ sender, receiver }) => io.emit('global_typing_status', { sender, receiver, isTyping: false }));
+
+    socket.on('mark_seen', ({ room, viewer }) => {
+        let chats = getChats(); let changed = false;
+        chats.forEach(c => { if (c.room === room && c.sender !== viewer && c.status !== 'seen') { c.status = 'seen'; changed = true; } });
+        if (changed) { saveChats(chats); io.to(room).emit('messages_seen', room); }
+    });
+});
+
+server.listen(3000, () => console.log(`🚀 VIP BACKEND + PRESENCE ENGINE READY`));
