@@ -19,10 +19,24 @@ const CHATS_FILE = './data/chats.json';
 if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, '[]');
 if (!fs.existsSync(CHATS_FILE)) fs.writeFileSync(CHATS_FILE, '[]');
 
-const getUsers = () => { try { return JSON.parse(fs.readFileSync(USERS_FILE)); } catch(e) { return []; } };
-const saveUsers = (data) => fs.writeFileSync(USERS_FILE, JSON.stringify(data));
-const getChats = () => { try { return JSON.parse(fs.readFileSync(CHATS_FILE)); } catch(e) { return []; } };
-const saveChats = (data) => fs.writeFileSync(CHATS_FILE, JSON.stringify(data));
+// 🔥 RAM CACHE ENGINE (1000x Faster)
+let memoryUsers = [];
+let memoryChats = [];
+
+try { memoryUsers = JSON.parse(fs.readFileSync(USERS_FILE)); } catch(e) { memoryUsers = []; }
+try { memoryChats = JSON.parse(fs.readFileSync(CHATS_FILE)); } catch(e) { memoryChats = []; }
+
+const getUsers = () => memoryUsers;
+const getChats = () => memoryChats;
+
+const saveUsers = (data) => { 
+    memoryUsers = data; 
+    fs.writeFile(USERS_FILE, JSON.stringify(data), (err) => { if(err) console.log("User save err"); }); 
+};
+const saveChats = (data) => { 
+    memoryChats = data; 
+    fs.writeFile(CHATS_FILE, JSON.stringify(data), (err) => { if(err) console.log("Chat save err"); }); 
+};
 
 // 📺 YOUTUBE API
 app.get('/api/videos', async (req, res) => {
@@ -61,7 +75,7 @@ app.get('/api/users/:me', (req, res) => {
 });
 app.get('/api/chats/:room', (req, res) => res.json(getChats().filter(c => c.room === req.params.room)));
 
-// 🔥 THE PRESENCE ENGINE (Online/Offline Tracking)
+// 🔥 PRESENCE ENGINE
 const onlineUsers = new Set();
 const socketMap = {}; 
 
