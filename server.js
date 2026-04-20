@@ -63,42 +63,24 @@ app.get('/api/chats/:room', (req, res) => res.json(getChats().filter(c => c.room
 
 // 🔥 THE PRESENCE ENGINE (Online/Offline Tracking)
 const onlineUsers = new Set();
-const socketMap = {}; // Socket ID se username track karne ke liye
+const socketMap = {}; 
 
 io.on('connection', (socket) => {
-    
-    // User online aata hai
     socket.on('go_online', (username) => {
-        socketMap[socket.id] = username;
-        onlineUsers.add(username);
-        io.emit('online_users_update', Array.from(onlineUsers)); // Sabko batao
+        socketMap[socket.id] = username; onlineUsers.add(username); io.emit('online_users_update', Array.from(onlineUsers));
     });
-
-    // User offline jata hai (App band karta hai)
     socket.on('disconnect', () => {
         const user = socketMap[socket.id];
-        if (user) {
-            onlineUsers.delete(user);
-            io.emit('online_users_update', Array.from(onlineUsers));
-            delete socketMap[socket.id];
-        }
+        if (user) { onlineUsers.delete(user); io.emit('online_users_update', Array.from(onlineUsers)); delete socketMap[socket.id]; }
     });
-
     socket.on('join_room', (room) => socket.join(room));
-    
     socket.on('send_message', (data) => {
-        data.status = 'sent'; let chats = getChats(); chats.push(data); saveChats(chats);
-        io.to(data.room).emit('receive_message', data);
+        data.status = 'sent'; let chats = getChats(); chats.push(data); saveChats(chats); io.to(data.room).emit('receive_message', data);
     });
-
-    // 💬 TYPING LOGIC (Room & Global)
     socket.on('typing', ({ room, sender }) => socket.to(room).emit('user_typing', sender));
     socket.on('stop_typing', ({ room }) => socket.to(room).emit('user_stopped_typing'));
-    
-    // Naya: Bahar list mein typing dikhane ke liye
     socket.on('typing_global', ({ sender, receiver }) => io.emit('global_typing_status', { sender, receiver, isTyping: true }));
     socket.on('stop_typing_global', ({ sender, receiver }) => io.emit('global_typing_status', { sender, receiver, isTyping: false }));
-
     socket.on('mark_seen', ({ room, viewer }) => {
         let chats = getChats(); let changed = false;
         chats.forEach(c => { if (c.room === room && c.sender !== viewer && c.status !== 'seen') { c.status = 'seen'; changed = true; } });
@@ -106,4 +88,5 @@ io.on('connection', (socket) => {
     });
 });
 
-server.listen(3000, () => console.log(`🚀 VIP BACKEND + PRESENCE ENGINE READY`));
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 VIP BACKEND LIVE ON PORT ${PORT}`));
