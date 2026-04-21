@@ -16,10 +16,6 @@ if (!fs.existsSync('./data')) fs.mkdirSync('./data');
 const USERS_FILE = './data/users.json';
 const CHATS_FILE = './data/chats.json';
 
-if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, '[]');
-if (!fs.existsSync(CHATS_FILE)) fs.writeFileSync(CHATS_FILE, '[]');
-
-// 🔥 RAM CACHE ENGINE (1000x Faster)
 let memoryUsers = [];
 let memoryChats = [];
 
@@ -29,41 +25,85 @@ try { memoryChats = JSON.parse(fs.readFileSync(CHATS_FILE)); } catch(e) { memory
 const getUsers = () => memoryUsers;
 const getChats = () => memoryChats;
 
-const saveUsers = (data) => { 
-    memoryUsers = data; 
-    fs.writeFile(USERS_FILE, JSON.stringify(data), (err) => { if(err) console.log("User save err"); }); 
-};
-const saveChats = (data) => { 
-    memoryChats = data; 
-    fs.writeFile(CHATS_FILE, JSON.stringify(data), (err) => { if(err) console.log("Chat save err"); }); 
-};
+const saveUsers = (data) => { memoryUsers = data; fs.writeFile(USERS_FILE, JSON.stringify(data), () => {}); };
+const saveChats = (data) => { memoryChats = data; fs.writeFile(CHATS_FILE, JSON.stringify(data), () => {}); };
 
-// 📺 YOUTUBE API
+const BAD_WORDS = ['porn', 'sex', 'xxx', 'xnxx', 'nude', 'naked', 'gandi', 'bf', 'bluefilm', 'mia', 'khalifa', 'brazzers'];
+
 app.get('/api/videos', async (req, res) => {
     const { type, q, page = 1 } = req.query;
+    if (q && BAD_WORDS.some(word => q.toLowerCase().includes(word))) return res.json({ results: [] }); 
+
     try {
         let query = type === 'home' ? `trending viral videos india part ${page}` : type === 'shorts' ? `viral shorts ${page}` : `${q} part ${page}`;
         const r = await ytSearch(query);
-        let videos = r.videos;
+        let videos = r.videos.filter(v => !BAD_WORDS.some(word => v.title.toLowerCase().includes(word)));
         if (type === 'shorts') videos = videos.filter(v => v.seconds < 120);
         res.json({ results: videos.map(v => ({ videoId: v.videoId, title: v.title, thumbnail: v.image, duration: v.timestamp, author: v.author.name })) });
     } catch (err) { res.status(500).json({ error: 'Server Error' }); }
 });
 
-// 🔐 AUTH & USERS
+// 🔥 SIGNUP (With Security Questions)
 app.post('/api/signup', (req, res) => {
-    const { username, password, dp } = req.body; let users = getUsers();
+    const { username, password, dp, friend, fruit } = req.body; let users = getUsers();
     if (users.find(u => u.username === username)) return res.status(400).json({ error: "Username taken!" });
-    users.push({ username, password, dp: dp || 'https://via.placeholder.com/150' }); saveUsers(users); res.json({ success: true, username, dp });
+    
+    const newUser = { username, password, dp: dp || 'https://via.placeholder.com/150', friend: friend.toLowerCase(), fruit: fruit.toLowerCase() };
+    users.push(newUser); saveUsers(users); 
+    io.emit('new_user_joined', { username: newUser.username, dp: newUser.dp });
+    res.json({ success: true, username, dp });
 });
+
 app.post('/api/login', (req, res) => {
     const { username, password } = req.body; let user = getUsers().find(u => u.username === username && u.password === password);
     if (user) res.json({ success: true, username: user.username, dp: user.dp }); else res.status(400).json({ error: "Wrong details!" });
 });
+
+// 🔥 FORGOT PASSWORD (Verify & Reset)
+app.post('/api/reset-password', (req, res) => {
+    const { username, friend, fruit, newPassword } = req.body; let users = getUsers();
+    let userIndex = users.findIndex(u => u.username === username);
+    if (userIndex === -1) return res.status(400).json({ error: "User not found!" });
+    
+    if (users[userIndex].friend === friend.toLowerCase() && users[userIndex].fruit === fruit.toLowerCase()) {
+        users[userIndex].password = newPassword;
+        saveUsers(users);
+        res.json({ success: true });
+    } else {
+        res.status(400).json({ error: "Security answers are incorrect!" });
+    }
+});
+
+// 🔥 DELETE ACCOUNT (Password Protected)
+app.post('/api/delete-account', (req, res) => {
+    const { username, password } = req.body; let users = getUsers();
+    let userIndex = users.findIndex(u => u.username === username && u.password === password);
+    
+    if (userIndex !== -1) {
+        users.splice(userIndex, 1); // User delete kar diya
+        saveUsers(users);
+        
+        // Uski saari chats bhi delete kar do
+        let chats = getChats();
+        chats = chats.filter(c => !c.room.includes(username));
+        saveChats(chats);
+        
+        io.emit('user_deleted', username); // Sabko bata do ki ye ud gaya
+        res.json({ success: true });
+    } else {
+        res.status(400).json({ error: "Incorrect Password!" });
+    }
+});
+
 app.post('/api/update-dp', (req, res) => {
     const { username, dp } = req.body; let users = getUsers(); let index = users.findIndex(u => u.username === username);
-    if(index !== -1) { users[index].dp = dp; saveUsers(users); res.json({ success: true, dp }); } else res.status(400).json({ error: "User not found" });
+    if(index !== -1) { 
+        users[index].dp = dp; saveUsers(users); 
+        io.emit('user_dp_updated', { username, dp });
+        res.json({ success: true, dp }); 
+    } else res.status(400).json({ error: "User not found" });
 });
+
 app.get('/api/users/:me', (req, res) => {
     const me = req.params.me; let users = getUsers().filter(u => u.username !== me); let allChats = getChats();
     let usersWithChats = users.map(u => {
@@ -73,15 +113,15 @@ app.get('/api/users/:me', (req, res) => {
         return { username: u.username, dp: u.dp, lastMessage: lastMsg, unread };
     }); res.json(usersWithChats);
 });
+
 app.get('/api/chats/:room', (req, res) => res.json(getChats().filter(c => c.room === req.params.room)));
 
-// 🔥 PRESENCE ENGINE
 const onlineUsers = new Set();
 const socketMap = {}; 
 
 io.on('connection', (socket) => {
     socket.on('go_online', (username) => {
-        socketMap[socket.id] = username; onlineUsers.add(username); io.emit('online_users_update', Array.from(onlineUsers));
+        socketMap[socket.id] = username; socket.join(username); onlineUsers.add(username); io.emit('online_users_update', Array.from(onlineUsers));
     });
     socket.on('disconnect', () => {
         const user = socketMap[socket.id];
@@ -89,7 +129,9 @@ io.on('connection', (socket) => {
     });
     socket.on('join_room', (room) => socket.join(room));
     socket.on('send_message', (data) => {
-        data.status = 'sent'; let chats = getChats(); chats.push(data); saveChats(chats); io.to(data.room).emit('receive_message', data);
+        data.status = 'sent'; let chats = getChats(); chats.push(data); saveChats(chats); io.to(data.room).emit('receive_message', data); 
+        const usersArr = data.room.split('_'); const receiver = usersArr[0] === data.sender ? usersArr[1] : usersArr[0];
+        io.to(receiver).emit('global_inbox_update'); 
     });
     socket.on('typing', ({ room, sender }) => socket.to(room).emit('user_typing', sender));
     socket.on('stop_typing', ({ room }) => socket.to(room).emit('user_stopped_typing'));
