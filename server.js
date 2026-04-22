@@ -35,15 +35,18 @@ app.get('/api/videos', async (req, res) => {
     if (q && BAD_WORDS.some(word => q.toLowerCase().includes(word))) return res.json({ results: [] }); 
 
     try {
-        let query = type === 'home' ? `trending viral videos india part ${page}` : type === 'shorts' ? `viral shorts ${page}` : `${q} part ${page}`;
+        // 🔥 COMEDY LONG VIDEOS ONLY ON HOME FEED
+        let query = type === 'home' ? `top hindi comedy standup videos long -shorts part ${page}` : type === 'shorts' ? `viral shorts ${page}` : `${q} part ${page}`;
         const r = await ytSearch(query);
+        
         let videos = r.videos.filter(v => !BAD_WORDS.some(word => v.title.toLowerCase().includes(word)));
+        if (type === 'home') videos = videos.filter(v => v.seconds > 180); // Minimum 3 minutes for long videos
         if (type === 'shorts') videos = videos.filter(v => v.seconds < 120);
+        
         res.json({ results: videos.map(v => ({ videoId: v.videoId, title: v.title, thumbnail: v.image, duration: v.timestamp, author: v.author.name })) });
     } catch (err) { res.status(500).json({ error: 'Server Error' }); }
 });
 
-// 🔥 SIGNUP (With Security Questions)
 app.post('/api/signup', (req, res) => {
     const { username, password, dp, friend, fruit } = req.body; let users = getUsers();
     if (users.find(u => u.username === username)) return res.status(400).json({ error: "Username taken!" });
@@ -59,40 +62,31 @@ app.post('/api/login', (req, res) => {
     if (user) res.json({ success: true, username: user.username, dp: user.dp }); else res.status(400).json({ error: "Wrong details!" });
 });
 
-// 🔥 FORGOT PASSWORD (Verify & Reset)
 app.post('/api/reset-password', (req, res) => {
     const { username, friend, fruit, newPassword } = req.body; let users = getUsers();
     let userIndex = users.findIndex(u => u.username === username);
     if (userIndex === -1) return res.status(400).json({ error: "User not found!" });
     
     if (users[userIndex].friend === friend.toLowerCase() && users[userIndex].fruit === fruit.toLowerCase()) {
-        users[userIndex].password = newPassword;
-        saveUsers(users);
-        res.json({ success: true });
-    } else {
-        res.status(400).json({ error: "Security answers are incorrect!" });
-    }
+        users[userIndex].password = newPassword; saveUsers(users); res.json({ success: true });
+    } else res.status(400).json({ error: "Security answers are incorrect!" });
 });
 
-// 🔥 DELETE ACCOUNT (Password Protected)
+// 🔥 STRICT ACCOUNT DELETE (Sirf usika account udayega)
 app.post('/api/delete-account', (req, res) => {
     const { username, password } = req.body; let users = getUsers();
     let userIndex = users.findIndex(u => u.username === username && u.password === password);
     
     if (userIndex !== -1) {
-        users.splice(userIndex, 1); // User delete kar diya
+        users.splice(userIndex, 1); 
         saveUsers(users);
-        
-        // Uski saari chats bhi delete kar do
         let chats = getChats();
-        chats = chats.filter(c => !c.room.includes(username));
+        chats = chats.filter(c => !c.room.includes(username)); // Uske rooms hata do
         saveChats(chats);
         
-        io.emit('user_deleted', username); // Sabko bata do ki ye ud gaya
+        io.emit('user_deleted', username); 
         res.json({ success: true });
-    } else {
-        res.status(400).json({ error: "Incorrect Password!" });
-    }
+    } else res.status(400).json({ error: "Incorrect Password!" });
 });
 
 app.post('/api/update-dp', (req, res) => {
