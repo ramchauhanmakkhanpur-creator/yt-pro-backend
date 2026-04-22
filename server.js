@@ -1,230 +1,191 @@
 const express = require('express');
-const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
-const fs = require('fs');
-const ytSearch = require('yt-search');
-const TelegramBot = require('node-telegram-bot-api'); // 🔥 TELEGRAM BOT API
+const cors = require('cors');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
 
-const USERS_FILE = './data/users.json';
-const CHATS_FILE = './data/chats.json';
-const WITHDRAW_FILE = './data/withdrawals.json'; // New File for tracking payments
-
-if (!fs.existsSync('./data')) fs.mkdirSync('./data');
-if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, '[]');
-if (!fs.existsSync(CHATS_FILE)) fs.writeFileSync(CHATS_FILE, '[]');
-if (!fs.existsSync(WITHDRAW_FILE)) fs.writeFileSync(WITHDRAW_FILE, '[]');
-
-let memoryUsers = [];
-let memoryChats = [];
-let memoryWithdrawals = [];
-
-try { memoryUsers = JSON.parse(fs.readFileSync(USERS_FILE)); } catch(e) { memoryUsers = []; }
-try { memoryChats = JSON.parse(fs.readFileSync(CHATS_FILE)); } catch(e) { memoryChats = []; }
-try { memoryWithdrawals = JSON.parse(fs.readFileSync(WITHDRAW_FILE)); } catch(e) { memoryWithdrawals = []; }
-
-const saveUsers = (data) => { memoryUsers = data; fs.writeFile(USERS_FILE, JSON.stringify(data), () => {}); };
-const saveChats = (data) => { memoryChats = data; fs.writeFile(CHATS_FILE, JSON.stringify(data), () => {}); };
-const saveWithdrawals = (data) => { memoryWithdrawals = data; fs.writeFile(WITHDRAW_FILE, JSON.stringify(data), () => {}); };
-
-// ==========================================
-// 🤖 TELEGRAM BOT LOGIC
-// ==========================================
-const token = '8599806886:AAGEe3CNv_r5qoCHQZwSNjeVqgcAwDrGyOA';
-const bot = new TelegramBot(token, { polling: true });
-
-let adminChatId = null; // Telegram will save your ID once you enter password
-
-bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, "🔒 Welcome Admin! Please enter the password to access the panel:");
-});
-
-bot.on('message', (msg) => {
-    if (msg.text === 'thakur@789A') {
-        adminChatId = msg.chat.id;
-        bot.sendMessage(adminChatId, "✅ **Access Granted!**\n\nYou are now the active Admin. You will receive withdrawal requests here.\n\nTo approve a payment, use command:\n`/success username`", { parse_mode: "Markdown" });
-    } else if (!msg.text.startsWith('/') && msg.text !== 'thakur@789A' && !adminChatId) {
-        bot.sendMessage(msg.chat.id, "❌ Incorrect Password.");
+// CORS for Socket.io (Frontend Vercel ya Localhost se connect karne ke liye)
+const io = new Server(server, {
+    cors: {
+        origin: "*", 
+        methods: ["GET", "POST"]
     }
 });
 
-// Admin Command to approve payment
-bot.onText(/\/success (.+)/, (msg, match) => {
-    if (msg.chat.id !== adminChatId) return bot.sendMessage(msg.chat.id, "❌ Unauthorized.");
-    
-    const targetUser = match[1];
-    let pendingReq = memoryWithdrawals.find(w => w.username === targetUser && w.status === 'pending');
-    
-    if (pendingReq) {
-        pendingReq.status = 'success';
-        saveWithdrawals(memoryWithdrawals);
-        bot.sendMessage(adminChatId, `✅ Superb! Marked @${targetUser}'s ₹${pendingReq.amountRs} payment as SUCCESS!`);
-        
-        // Alert user on app in real-time!
-        io.to(targetUser).emit('payment_approved', { amount: pendingReq.amountRs, coins: pendingReq.coinsDeducted });
-    } else {
-        bot.sendMessage(adminChatId, `⚠️ No pending withdrawal found for @${targetUser}.`);
+// ==========================================
+// 🗄️ IN-MEMORY DATABASE (Testing ke liye)
+// ==========================================
+let users = [
+    { username: 'admin', dp: 'https://ui-avatars.com/api/?name=Admin&background=e1306c&color=fff', coins: 5000 },
+    { username: 'priya_99', dp: 'https://ui-avatars.com/api/?name=Priya&background=00a8ff&color=fff', coins: 150 },
+    { username: 'rahul_bhai', dp: 'https://ui-avatars.com/api/?name=Rahul&background=2ed573&color=fff', coins: 300 }
+];
+let messagesDB = [];
+let feedbacksDB = [];
+let onlineUsers = new Set();
+
+// ==========================================
+// 🌐 REST API ROUTES (Frontend Calls)
+// ==========================================
+
+// 1. Get All Users (DMs ke liye)
+app.get('/api/users', (req, res) => {
+    res.json({ users });
+});
+
+// 2. Get Specific User & Update Global List
+app.get('/api/users/:username', (req, res) => {
+    // Agar koi naya user login kar raha hai jo list mein nahi hai, toh use add kar lo
+    const { username } = req.params;
+    if (!users.find(u => u.username === username)) {
+        users.push({ 
+            username, 
+            dp: `https://ui-avatars.com/api/?name=${username}&background=random&color=fff`, 
+            coins: 0 
+        });
+        io.emit('new_user_joined'); // Sabko batao naya banda aaya hai
     }
+    res.json(users);
 });
 
-
-// ==========================================
-// 💸 WITHDRAWAL API
-// ==========================================
-app.post('/api/withdraw', (req, res) => {
-    const { username, upiId } = req.body;
-    let userIndex = memoryUsers.findIndex(u => u.username === username);
-    
-    if (userIndex === -1) return res.status(400).json({ error: "User not found" });
-    
-    let userCoins = memoryUsers[userIndex].coins || 0;
-    
-    if (userCoins < 1000) return res.status(400).json({ error: "Minimum 1000 Coins required!" });
-    
-    // Check if already pending
-    let hasPending = memoryWithdrawals.some(w => w.username === username && w.status === 'pending');
-    if (hasPending) return res.status(400).json({ error: "You already have a pending withdrawal!" });
-
-    // Calculate money: 1000 Coins = 10 Rs. (1 Coin = 0.01 Rs)
-    let amountRs = Math.floor(userCoins / 100); 
-    let remainingCoins = userCoins % 100; // Leave the change in wallet
-
-    memoryUsers[userIndex].coins = remainingCoins;
-    saveUsers(memoryUsers);
-
-    // Save Request
-    const newRequest = { id: Date.now(), username, upiId, coinsDeducted: userCoins - remainingCoins, amountRs, status: 'pending', date: new Date().toLocaleString() };
-    memoryWithdrawals.push(newRequest);
-    saveWithdrawals(memoryWithdrawals);
-
-    // Send Alert to Telegram Admin
-    if (adminChatId) {
-        let msg = `🚨 **NEW WITHDRAWAL REQUEST** 🚨\n\n👤 **User:** @${username}\n🪙 **Coins:** ${newRequest.coinsDeducted}\n💸 **Amount to Pay:** ₹${amountRs}\n🏦 **UPI ID:** \`${upiId}\`\n\n_Pay on UPI, then copy-paste this command to approve:_\n\n\`/success ${username}\``;
-        bot.sendMessage(adminChatId, msg, { parse_mode: "Markdown" });
-    }
-
-    res.json({ success: true, remainingCoins, amountRs });
+// 3. Get Chat History Between 2 Users
+app.get('/api/chats/:room', (req, res) => {
+    const { room } = req.params;
+    const chatHistory = messagesDB.filter(m => m.room === room);
+    res.json(chatHistory);
 });
 
-app.get('/api/withdrawals/:username', (req, res) => {
-    res.json(memoryWithdrawals.filter(w => w.username === req.params.username));
+app.get('/api/messages/:user1/:user2', (req, res) => {
+    const room = [req.params.user1, req.params.user2].sort().join('_');
+    const chatHistory = messagesDB.filter(m => m.room === room);
+    res.json({ messages: chatHistory });
 });
 
-
-// ==========================================
-// REST OF THE APIS (Videos, Auth, Chats)
-// ==========================================
-const BAD_WORDS = ['porn', 'sex', 'xxx', 'gandi', 'nude'];
-
-app.get('/api/videos', async (req, res) => {
-    const { type, q, page = 1 } = req.query;
-    if (q && BAD_WORDS.some(word => q.toLowerCase().includes(word))) return res.json({ results: [] }); 
-    try {
-        let query = type === 'home' ? `trending viral videos india part ${page}` : type === 'shorts' ? `viral shorts ${page}` : `${q} part ${page}`;
-        const r = await ytSearch(query);
-        let videos = r.videos.filter(v => !BAD_WORDS.some(word => v.title.toLowerCase().includes(word)));
-        res.json({ results: videos.map(v => ({ videoId: v.videoId, title: v.title, thumbnail: v.image, duration: v.timestamp, author: v.author.name })) });
-    } catch (err) { res.status(500).json({ error: 'Server Error' }); }
+// 4. Save New Message (REST fallback)
+app.post('/api/messages', (req, res) => {
+    const msg = req.body;
+    if (!msg.room) msg.room = [msg.sender, msg.receiver].sort().join('_');
+    if (!msg.timestamp) msg.timestamp = Date.now();
+    messagesDB.push(msg);
+    res.json({ success: true, message: msg });
 });
 
-app.post('/api/signup', (req, res) => {
-    const { username, password, dp, friend, fruit } = req.body;
-    if (memoryUsers.find(u => u.username === username)) return res.status(400).json({ error: "Username taken!" });
-    const newUser = { username, password, dp: dp || 'https://via.placeholder.com/150', friend: friend?.toLowerCase() || '', fruit: fruit?.toLowerCase() || '', coins: 0 };
-    memoryUsers.push(newUser); saveUsers(memoryUsers); 
-    io.emit('new_user_joined');
-    res.json({ success: true, username, dp: newUser.dp });
-});
-
-app.post('/api/login', (req, res) => {
-    const { username, password } = req.body;
-    let user = memoryUsers.find(u => u.username === username && u.password === password);
-    if (user) res.json({ success: true, username: user.username, dp: user.dp }); 
-    else res.status(400).json({ error: "Wrong details!" });
-});
-
-app.post('/api/reset-password', (req, res) => {
-    const { username, friend, fruit, newPassword } = req.body;
-    let userIndex = memoryUsers.findIndex(u => u.username === username);
-    if (userIndex === -1) return res.status(400).json({ error: "User not found!" });
-    if (memoryUsers[userIndex].friend === friend.toLowerCase() && memoryUsers[userIndex].fruit === fruit.toLowerCase()) {
-        memoryUsers[userIndex].password = newPassword; saveUsers(memoryUsers); res.json({ success: true });
-    } else res.status(400).json({ error: "Security answers are incorrect!" });
-});
-
-app.post('/api/delete-account', (req, res) => {
-    const { username, password } = req.body;
-    let userIndex = memoryUsers.findIndex(u => u.username === username && u.password === password);
-    if (userIndex !== -1) {
-        memoryUsers.splice(userIndex, 1); saveUsers(memoryUsers);
-        memoryChats = memoryChats.filter(c => !c.room.includes(username)); saveChats(memoryChats);
-        io.emit('user_deleted', username); res.json({ success: true });
-    } else res.status(400).json({ error: "Incorrect Password!" });
-});
-
-app.post('/api/update-dp', (req, res) => {
-    const { username, dp } = req.body; let index = memoryUsers.findIndex(u => u.username === username);
-    if(index !== -1) { memoryUsers[index].dp = dp; saveUsers(memoryUsers); io.emit('user_dp_updated', { username, dp }); res.json({ success: true, dp }); } 
-    else res.status(400).json({ error: "User not found" });
-});
-
+// 5. User Data & Coins (Top Nav ke liye)
 app.get('/api/user-data/:username', (req, res) => {
-    const user = memoryUsers.find(u => u.username === req.params.username);
-    if (user) res.json({ coins: user.coins || 0 });
-    else res.status(404).send();
+    const user = users.find(u => u.username === req.params.username);
+    res.json({ coins: user ? user.coins : 0 });
 });
 
+// 6. Reward Coins (Ads dekhne par)
 app.post('/api/reward-ad', (req, res) => {
     const { username } = req.body;
-    let userIndex = memoryUsers.findIndex(u => u.username === username);
-    if (userIndex !== -1) {
-        memoryUsers[userIndex].coins = (memoryUsers[userIndex].coins || 0) + 50;
-        saveUsers(memoryUsers);
-        res.json({ success: true, coins: memoryUsers[userIndex].coins });
-    } else res.status(400).json({ error: "User not found" });
+    const user = users.find(u => u.username === username);
+    if (user) {
+        user.coins += 10; // Har ad ka 10 coin
+    }
+    res.json({ success: true });
 });
 
-app.get('/api/users/:me', (req, res) => {
-    const me = req.params.me; 
-    let usersWithChats = memoryUsers.filter(u => u.username !== me).map(u => {
-        let room = [me, u.username].sort().join('_'); let roomChats = memoryChats.filter(c => c.room === room);
-        return { username: u.username, dp: u.dp, lastMessage: roomChats[roomChats.length - 1] || null, unread: roomChats.filter(c => c.sender === u.username && c.status !== 'seen').length };
-    }); res.json(usersWithChats);
+// 7. Feedbacks (Live Board ke liye)
+app.get('/api/feedbacks', (req, res) => {
+    res.json({ feedbacks: feedbacksDB });
 });
 
-app.get('/api/chats/:room', (req, res) => res.json(memoryChats.filter(c => c.room === req.params.room)));
+app.post('/api/feedbacks', (req, res) => {
+    const fb = req.body;
+    feedbacksDB.push(fb);
+    res.json({ success: true });
+});
 
-const onlineUsers = new Set();
-const socketMap = {}; 
+// 8. Dummy Videos (Home/Shorts/Search crash na ho isliye)
+app.get('/api/videos', (req, res) => {
+    res.json({
+        results: [
+            { videoId: 'dQw4w9WgXcQ', title: 'Top 10 Coding Tips', author: 'Tech Bro', thumbnail: 'https://via.placeholder.com/300x200' },
+            { videoId: 'jNQXAC9IVRw', title: 'Funny Meme Compilation', author: 'Meme King', thumbnail: 'https://via.placeholder.com/300x200' }
+        ]
+    });
+});
+
+
+// ==========================================
+// ⚡ SOCKET.IO (Real-time Jadoo)
+// ==========================================
 
 io.on('connection', (socket) => {
+    console.log('⚡ User Connected:', socket.id);
+
+    // 🟢 User Online Hua
     socket.on('go_online', (username) => {
-        socketMap[socket.id] = username; socket.join(username); onlineUsers.add(username); io.emit('online_users_update', Array.from(onlineUsers));
+        socket.username = username;
+        onlineUsers.add(username);
+        io.emit('online_users_update', Array.from(onlineUsers));
     });
-    socket.on('disconnect', () => {
-        const user = socketMap[socket.id];
-        if (user) { onlineUsers.delete(user); io.emit('online_users_update', Array.from(onlineUsers)); delete socketMap[socket.id]; }
+
+    // 🚪 Chat Room Join
+    socket.on('join_room', (room) => {
+        socket.join(room);
     });
-    socket.on('join_room', (room) => socket.join(room));
+
+    // 📩 Message Bhejna
     socket.on('send_message', (data) => {
-        data.status = 'sent'; memoryChats.push(data); saveChats(memoryChats); io.to(data.room).emit('receive_message', data); 
-        const usersArr = data.room.split('_'); const receiver = usersArr[0] === data.sender ? usersArr[1] : usersArr[0];
-        io.to(receiver).emit('global_inbox_update'); 
+        messagesDB.push(data); // Save in backend RAM
+        socket.to(data.room).emit('receive_message', data); // Dusre user ko bhejo
+        io.emit('global_inbox_update'); // DMs list update karne ke liye
     });
-    socket.on('typing', ({ room, sender }) => socket.to(room).emit('user_typing', sender));
-    socket.on('stop_typing', ({ room }) => socket.to(room).emit('user_stopped_typing'));
+
+    // 👀 Message Seen
     socket.on('mark_seen', ({ room, viewer }) => {
-        let changed = false; memoryChats.forEach(c => { if (c.room === room && c.sender !== viewer && c.status !== 'seen') { c.status = 'seen'; changed = true; } });
-        if (changed) { saveChats(memoryChats); io.to(room).emit('messages_seen', room); }
+        messagesDB = messagesDB.map(m => {
+            if (m.room === room && m.sender !== viewer) {
+                return { ...m, status: 'seen' };
+            }
+            return m;
+        });
+        io.to(room).emit('messages_seen', room);
+    });
+
+    // ✍️ Typing Status (Room)
+    socket.on('typing', ({ room, sender }) => {
+        socket.to(room).emit('user_typing', sender);
+    });
+    socket.on('stop_typing', ({ room }) => {
+        socket.to(room).emit('user_stopped_typing');
+    });
+
+    // ✍️ Global Typing Status (List ke upar dikhane ke liye)
+    socket.on('typing_global', (data) => {
+        io.emit('global_typing_status', { ...data, isTyping: true });
+    });
+    socket.on('stop_typing_global', (data) => {
+        io.emit('global_typing_status', { ...data, isTyping: false });
+    });
+
+    // 📢 Real-Time Feedback (Sabko instantly dikhane ke liye)
+    socket.on('send_feedback', (data) => {
+        // Broadcast to everyone EXCEPT sender (sender ne already optimistic UI se add kar liya hai)
+        socket.broadcast.emit('receive_feedback', data); 
+    });
+
+    // 🔴 User Offline Hua
+    socket.on('disconnect', () => {
+        console.log('❌ User Disconnected:', socket.id);
+        if (socket.username) {
+            onlineUsers.delete(socket.username);
+            io.emit('online_users_update', Array.from(onlineUsers));
+        }
     });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`🚀 FAST VIP BACKEND WITH TELEGRAM BOT LIVE ON PORT ${PORT}`));
+// ==========================================
+// 🚀 SERVER START
+// ==========================================
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => {
+    console.log(`🔥 Backend Engine is running like a Ferrari on http://localhost:${PORT}`);
+});
